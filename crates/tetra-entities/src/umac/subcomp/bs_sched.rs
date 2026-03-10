@@ -155,6 +155,10 @@ impl BsChannelScheduler {
         );
     }
 
+    pub fn is_hangtime(&self, ts: u8) -> bool {
+        self.hangtime[ts as usize - 1]
+    }
+
     fn is_hangtime_effective(&self, ts: u8) -> bool {
         let idx = ts as usize - 1;
         if !self.hangtime[idx] {
