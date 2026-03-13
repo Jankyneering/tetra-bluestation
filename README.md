@@ -21,32 +21,6 @@ The documentation repository contains :
 
 Contributions to the documentation follow the same pull-request-based workflow as the main codebase, see the appropriate "Contributions" chapter.
 
-## Quickstart
-
-Build `tetra-bluestation``
-
-```zsh
-cargo build --release
-```
-
-Build for `aarch64-unknown-linux-gnu` using the provided Dockerfile, which is useful for running on ARM-based SBCs like the Raspberry Pi :
-
-```zsh
-cross build --release --target aarch64-unknown-linux-gnu
-```
-
-Run `tetra-bluestation` with the appropriate configuration file, for example :
-
-```zsh
-./target/release/tetra-bluestation ./example_config/config.toml
-```
-
-Filter out the phy/lmac/common logs for a more concise output, which is useful for debugging higher layers of the stack :
-
-```zsh
-./target/release/tetra-bluestation ./example_config/config.toml | grep -v "phy\|common\|lmac"
-```
-
 ## Acknowledgements
 
 - Thanks to Harald Welte and the osmocom crew for their amazing initial work on osmocom-tetra, without which this project would not have existed.
