@@ -1,6 +1,7 @@
 //! Resampling, buffering and timestamp handling
 //! between SDR device and modulator/demodulator code.
 
+use num::Complex;
 use rustfft;
 use tetra_config::bluestation::SharedConfig;
 use tetra_config::bluestation::StackMode;
@@ -126,7 +127,7 @@ impl RxTxDevSoapySdr {
             },
 
             tx_dsp: if sdr.tx_enabled() {
-                Some(TxDsp::new(&mut fft_planner, &mut sdr, &phy_config))
+                Some(TxDsp::new(&mut fft_planner, &mut sdr, &phy_config, cfg))
             } else {
                 None
             },
@@ -348,10 +349,30 @@ struct TxDsp {
     block_count: fcfb::BlockCount,
     initial_time: i64,
     modulators: Vec<ModulatorChannel>,
+
+    /// Complex DPD polynomial coefficients operating on |x|² (squared magnitude).
+    ///
+    /// The predistorter evaluates two real Horner polynomials over u = |x|²:
+    ///
+    ///   A(u) = am_am[0] + am_am[1]·u + am_am[2]·u² + ...   (AM/AM correction)
+    ///   B(u) = am_pm[0] + am_pm[1]·u + am_pm[2]·u² + ...   (AM/PM correction)
+    ///
+    /// and applies the combined complex gain:
+    ///
+    ///   y[n] = x[n] · (A(u) + j·B(u))
+    ///
+    /// Using |x|² instead of |x| avoids a sqrt() in the hot loop, halving the
+    /// cost relative to the previous magnitude-based polynomial.  The coefficient
+    /// values must be fitted accordingly (i.e. in the u = power domain, not the
+    /// amplitude domain).
+    ///
+    /// Identity / fast path: am_am = [1.0], am_pm = [0.0].
+    dpd_am_am: Vec<f32>,
+    dpd_am_pm: Vec<f32>,
 }
 
 impl TxDsp {
-    fn new(fft_planner: &mut FftPlanner, sdr: &mut soapyio::SoapyIo, phy_config: &PhyConfig) -> Self {
+    fn new(fft_planner: &mut FftPlanner, sdr: &mut soapyio::SoapyIo, phy_config: &PhyConfig, cfg: &SharedConfig) -> Self {
         let sdr_sample_rate = sdr.tx_sample_rate();
         let fcfb_params = fcfb::SynthesisOutputParameters {
             ifft_size: (sdr_sample_rate / 500.0).round() as usize,
@@ -367,11 +388,37 @@ impl TxDsp {
             modulators.push(ModulatorChannel::new(fft_planner, fcfb_params, *dl_freq, modulator::Mode::Dl));
         }
 
+        // Extract DPD coefficients from config.
+        // Both vectors default to identity ([1.0] / [0.0]) when absent.
+        let (dpd_am_am, dpd_am_pm) = cfg
+            .config()
+            .phy_io
+            .soapysdr
+            .as_ref()
+            .and_then(|s| s.predistortion.as_ref())
+            .map(|p| (p.am_am_coefficients.clone(), p.am_pm_coefficients.clone()))
+            .unwrap_or_else(|| (vec![1.0], vec![0.0]));
+
+        let identity = dpd_am_am.len() == 1 && dpd_am_am[0] == 1.0
+            && dpd_am_pm.len() == 1 && dpd_am_pm[0] == 0.0;
+
+        if identity {
+            tracing::info!("PA predistortion: disabled (identity)");
+        } else {
+            tracing::info!(
+                "PA predistortion: enabled — AM/AM {} coefficients: {:?} | AM/PM {} coefficients: {:?}",
+                dpd_am_am.len(), dpd_am_am,
+                dpd_am_pm.len(), dpd_am_pm,
+            );
+        }
+
         Self {
             fcfb,
             block_count: 0,
             initial_time: 0, // TODO: get it from RX
             modulators,
+            dpd_am_am,
+            dpd_am_pm,
         }
     }
 
@@ -423,21 +470,67 @@ impl TxDsp {
             }
         }
 
+        // Cache output block size before borrowing fcfb output buffer.
+        let output_block_size = self.fcfb.output_block_size() as SampleCount;
+
+        // fcfb.process() returns &[ComplexSample] — a shared borrow of the
+        // internal IFFT buffer.  We must copy to apply DPD in-place.
         let tx_signal = self.fcfb.process();
 
         // TODO: compensate for delay of SDR
-        let sdr_sample_count = tx_signal.len() as SampleCount * self.block_count;
+        let sdr_sample_count = self.block_count as SampleCount * output_block_size;
 
         // Increment block count before calling sdr.transmit with ?,
         // so we do not end up producing the same block again even if transmit fails.
         self.block_count += 1;
 
-        sdr.transmit(tx_signal, Some(sdr_sample_count))?;
+        // Fast path: identity coefficients — skip DPD entirely.
+        let identity = self.dpd_am_am.len() == 1 && self.dpd_am_am[0] == 1.0
+            && self.dpd_am_pm.len() == 1 && self.dpd_am_pm[0] == 0.0;
+
+        if identity {
+            sdr.transmit(tx_signal, Some(sdr_sample_count))?;
 
         // tracing::trace!("Produced transmit block {} ({} samples in future)",
         //     self.block_count - 1,
         //     sdr_sample_count - sdr.tx_current_count().unwrap_or(0),
         // );
+        } else {
+            // Complex polynomial predistortion:
+            //
+            //   y[n] = x[n] · (A(u) + j·B(u)),   u = |x[n]|²
+            //
+            // A(u) = Horner(am_am_coefficients, u)   — AM/AM correction
+            // B(u) = Horner(am_pm_coefficients, u)   — AM/PM correction
+            //
+            // Operating on |x|² (power) instead of |x| (amplitude) avoids
+            // a sqrt() per sample.  Coefficients must be measured / fitted
+            // in the power domain accordingly.
+            //
+            // The multiplication x · (A + jB) simultaneously scales the
+            // magnitude (AM/AM) and rotates the phase (AM/PM), which is
+            // exactly the inverse of both PA distortion mechanisms.
+            let am_am = &self.dpd_am_am;
+            let am_pm = &self.dpd_am_pm;
+
+            let tx_signal: Vec<ComplexSample> = tx_signal
+                .iter()
+                .map(|&x| {
+                    // u = |x|² — avoids sqrt, valid since polynomials are
+                    // fitted in the power (squared-magnitude) domain.
+                    let u = x.norm_sqr();
+
+                    // Horner evaluation of both polynomials.
+                    let a = am_am.iter().rev().fold(0.0f32, |acc, &c| acc * u + c);
+                    let b = am_pm.iter().rev().fold(0.0f32, |acc, &c| acc * u + c);
+
+                    // Apply the complex gain: x · (A + jB)
+                    x * Complex::new(a, b)
+                })
+                .collect();
+
+            sdr.transmit(&tx_signal, Some(sdr_sample_count))?;
+        }
 
         Ok(true)
     }

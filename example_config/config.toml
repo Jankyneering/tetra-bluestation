@@ -68,6 +68,82 @@ tx_gain_pga = 35.0
 
 ###############################################################################
 
+# Complex polynomial pre-distortion for PA linearisation (optional)
+#
+# Applies a memoryless complex polynomial correction to each baseband sample
+# immediately before it is sent to the SDR hardware:
+#
+#   y[n] = x[n] · (A(u) + j·B(u))    where u = |x[n]|²  (instantaneous power)
+#
+# A(u) = am_am[0] + am_am[1]·u + am_am[2]·u² + ...   corrects AM/AM (gain compression)
+# B(u) = am_pm[0] + am_pm[1]·u + am_pm[2]·u² + ...   corrects AM/PM (phase rotation)
+#
+# Both polynomials are evaluated via Horner's method over the SQUARED magnitude
+# (power), which avoids a sqrt() per sample in the hot path.
+# Coefficients must therefore be fitted in the power domain (u = |x|²),
+# NOT the amplitude domain (r = |x|).
+#
+# ┌─────────────────────────────────────────────────────────────────┐
+# │  IMPORTANT — power-domain fitting                               │
+# │  If your measurement tool gives you curves vs. amplitude r,     │
+# │  substitute u = r² before fitting.  A polynomial in r of        │
+# │  degree N becomes a polynomial in u of degree ⌈N/2⌉.           │
+# └─────────────────────────────────────────────────────────────────┘
+#
+# ── Identity (pass-through, no correction) ───────────────────────
+#   am_am_coefficients = [1.0]     →  A(u) = 1  for all u
+#   am_pm_coefficients = [0.0]     →  B(u) = 0  for all u
+#   → y[n] = x[n] · (1 + j·0) = x[n]
+#
+# ── Coefficient guide ─────────────────────────────────────────────
+#
+#   am_am_coefficients  (real part — corrects amplitude compression):
+#     am_am[0] = 1.0        small-signal linear gain  (always 1.0)
+#     am_am[1] = 0.0        first-order power correction (often 0)
+#     am_am[2] = -0.1..-0.3 third-order compression term (most common)
+#     am_am[3] = 0.0..0.1   fifth-order term (use sparingly)
+#
+#   am_pm_coefficients  (imaginary part — corrects phase rotation):
+#     am_pm[0] = 0.0        constant phase offset  (always 0.0)
+#     am_pm[1] = 0.0..0.1   phase tilt with drive level
+#     am_pm[2] = ...        higher-order phase correction
+#
+#   A positive am_pm[1] adds a pre-leading phase rotation that compensates
+#   a PA that lags phase with increasing drive (the most common case).
+#
+# ── Fitting procedure ─────────────────────────────────────────────
+#
+#   1. Drive the PA at N power levels spanning its operating range.
+#   2. For each level, measure output amplitude and output phase shift
+#      relative to the small-signal linear extrapolation.
+#      (Use a VNA, spectrum analyser + directional coupler, or the
+#       SDR's own observation RX path if available.)
+#   3. Compute the desired AM/AM inverse:
+#        am_am_target[k] = P_in[k] / P_out[k]   (in linear, not dB)
+#   4. Compute the desired AM/PM inverse:
+#        am_pm_target[k] = -measured_phase_shift[k]   (in radians)
+#   5. Fit polynomials to both curves vs. u = |x|² using least-squares
+#      (e.g. numpy.polyfit in Python, returning highest-degree first;
+#       reverse the order before entering here).
+#   6. Enter the resulting coefficients below.
+#
+# ── Example: mild 3rd-order compression + slight AM/PM ───────────
+#
+# [phy_io.soapysdr.predistortion]
+# am_am_coefficients = [1.0, 0.0, -0.12, 0.04]
+# am_pm_coefficients = [0.0, 0.06]
+#
+# ── Example: AM/AM only (no AM/PM correction) ─────────────────────
+#
+# [phy_io.soapysdr.predistortion]
+# am_am_coefficients = [1.0, 0.0, -0.15, 0.05]
+# am_pm_coefficients = [0.0]
+#
+# Omit the entire [phy_io.soapysdr.predistortion] section to disable DPD
+# with zero runtime overhead (samples bypass the polynomial loop entirely).
+
+###############################################################################
+
 # Network Information
 [net_info]
 # Mobile Country Code (MCC) - identifies your country

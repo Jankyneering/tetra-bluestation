@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use serde::Deserialize;
 use toml::Value;
 
-use crate::bluestation::{CfgLimeSdr, CfgSoapySdr, CfgSxCeiver, CfgUsrpB2xx, SoapySdrDto, SoapySdrIoCfg};
+use crate::bluestation::{CfgLimeSdr, CfgSoapySdr, CfgSxCeiver, CfgUsrpB2xx, SoapySdrDto, SoapySdrIoCfg, CfgPredistortion};
 
 /// The PHY layer backend type
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -51,6 +51,8 @@ pub fn phy_dto_to_cfg(src: PhyIoDto) -> CfgPhyIo {
             dl_freq: soapy_dto.tx_freq,
             ppm_err: soapy_dto.ppm_err.unwrap_or(0.0),
             io_cfg: SoapySdrIoCfg::default(),
+            // Convert the DTO into the config type; None stays None (DPD disabled).
+            predistortion: soapy_dto.predistortion.map(CfgPredistortion::from),
         };
 
         if let Some(usrp_dto) = soapy_dto.iocfg_usrpb2xx {
